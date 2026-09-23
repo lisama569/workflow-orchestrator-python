@@ -1,0 +1,178 @@
+"""门面服务:校验提交、幂等去重、查询、取消与终止。"""
+from __future__ import annotations
+
+import logging
+import time
+
+from .errors import (
+    CycleDetectedError,
+    DuplicateIdempotencyKeyError,
+    DuplicateTaskIdError,
+    EmptyWorkflowError,
+    MissingDependencyError,
+    TaskNotFoundError,
+    TerminalStateError,
+    WorkflowNotFoundError,
+)
+from .models import RetryPolicy, TaskDef, TaskState, TaskStatus, WorkflowState, WorkflowStatus
+from .scheduler import Scheduler
+from .store import JsonStore
+
+logger = logging.getLogger("orchestrator.service")
+
+
+class OrchestratorService:
+    """对外门面:所有状态变更经此入口,保证校验/幂等/持久化顺序确定。"""
+
+    def __init__(self, store: JsonStore, scheduler: Scheduler) -> None:
+        self.store = store
+        self.scheduler = scheduler
+
+    # ================= 提交 =================
+    def submit_workflow(
+        self,
+        workflow_id: str,
+        tasks: list[TaskDef],
+        idempotency_key: str | None = None,
+    ) -> WorkflowState:
+        tasks = list(tasks or [])
+        self.validate(tasks)
+
+        existing_by_id = self.store.get(workflow_id)
+        if existing_by_id is not None:
+            # 同一工作流 id + 同一幂等键:视为重复提交,返回既有对象,不产生执行。
+            if idempotency_key is not None and existing_by_id.idempotency_key == idempotency_key:
+                logger.info(
+                    "duplicate submission ignored: workflow=%s idempotency_key=%s -> existing workflow",
+                    workflow_id,
+                    idempotency_key,
+                )
+                return existing_by_id
+            raise DuplicateIdempotencyKeyError(workflow_id)
+
+        if idempotency_key is not None:
+            for wf in self.store.load_all().values():
+                if wf.idempotency_key == idempotency_key:
+                    logger.info(
+                        "duplicate submission ignored: idempotency_key=%s -> existing workflow=%s",
+                        idempotency_key,
+                        wf.id,
+                    )
+                    raise DuplicateIdempotencyKeyError(wf.id)
+
+        now = time.time()
+        wf = self.build_state(workflow_id, tasks, idempotency_key, now)
+        self.store.save_workflow(wf)
+        logger.info(
+            "workflow=%s accepted: %d task(s), idempotency_key=%s",
+            workflow_id,
+            len(tasks),
+            idempotency_key,
+        )
+        self.scheduler.notify()
+        return wf
+
+    # ================= 校验 =================
+    @staticmethod
+    def validate(tasks: list[TaskDef]) -> None:
+        if not tasks:
+            raise EmptyWorkflowError()
+        ids = [t.id for t in tasks]
+        if len(set(ids)) != len(ids):
+            dup = next(i for i in ids if ids.count(i) > 1)
+            raise DuplicateTaskIdError(dup)
+        id_set = set(ids)
+        for t in tasks:
+            for dep in t.dependencies:
+                if dep not in id_set:
+                    raise MissingDependencyError(t.id, dep)
+        deps = {t.id: list(t.dependencies) for t in tasks}
+        cycle = OrchestratorService.detect_cycle(ids, deps)
+        if cycle is not None:
+            raise CycleDetectedError(cycle)
+
+    @staticmethod
+    def detect_cycle(task_ids: list[str], deps: dict[str, list[str]]) -> list[str] | None:
+        """DFS 三色法检测环;发现回边时返回环上节点序列(首尾同节点)。"""
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {tid: WHITE for tid in task_ids}
+        stack: list[str] = []
+
+        def dfs(node: str) -> list[str] | None:
+            color[node] = GRAY
+            stack.append(node)
+            for nxt in deps.get(node, []):
+                if color.get(nxt) == GRAY:
+                    idx = stack.index(nxt)
+                    return stack[idx:] + [nxt]
+                if color.get(nxt) == WHITE:
+                    found = dfs(nxt)
+                    if found is not None:
+                        return found
+            stack.pop()
+            color[node] = BLACK
+            return None
+
+        for tid in task_ids:
+            if color[tid] == WHITE:
+                found = dfs(tid)
+                if found is not None:
+                    return found
+        return None
+
+    # ================= 查询 =================
+    def get_workflow(self, workflow_id: str) -> WorkflowState:
+        wf = self.store.get(workflow_id)
+        if wf is None:
+            raise WorkflowNotFoundError(workflow_id)
+        return wf
+
+    def get_task(self, workflow_id: str, task_id: str) -> TaskState:
+        wf = self.get_workflow(workflow_id)
+        t = wf.tasks.get(task_id)
+        if t is None:
+            raise TaskNotFoundError(workflow_id, task_id)
+        return t
+
+    # ================= 取消 / 终止 =================
+    def cancel_workflow(self, workflow_id: str) -> WorkflowState:
+        self.get_workflow(workflow_id)  # 不存在 -> WorkflowNotFoundError
+        self.scheduler.request_cancel(workflow_id)
+        return self.get_workflow(workflow_id)
+
+    def terminate_workflow(self, workflow_id: str) -> WorkflowState:
+        wf = self.get_workflow(workflow_id)
+        if wf.status == WorkflowStatus.CANCELLED:
+            return wf  # 终态不可逆:重复终止幂等返回
+        self.scheduler.request_terminate(workflow_id)
+        return self.get_workflow(workflow_id)
+
+    # ================= 构造 =================
+    @staticmethod
+    def build_state(
+        workflow_id: str,
+        tasks: list[TaskDef],
+        idempotency_key: str | None,
+        now: float,
+    ) -> WorkflowState:
+        states: dict[str, TaskState] = {}
+        for td in tasks:
+            max_attempts = 1 + td.retry_policy.max_retries if td.retryable else 1
+            states[td.id] = TaskState(
+                id=td.id,
+                action=td.action,
+                params=dict(td.params),
+                dependencies=list(td.dependencies),
+                retryable=td.retryable,
+                retry_policy=RetryPolicy(**td.retry_policy.__dict__),
+                status=TaskStatus.PENDING,
+                max_attempts=max_attempts,
+            )
+        return WorkflowState(
+            id=workflow_id,
+            idempotency_key=idempotency_key,
+            tasks=states,
+            status=WorkflowStatus.PENDING,
+            created_at=now,
+            updated_at=now,
+        )
