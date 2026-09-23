@@ -1,8 +1,4 @@
-from fastapi import FastAPI
+"""本地运行入口：uv run uvicorn main:app"""
+from app.api import create_app
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app()
