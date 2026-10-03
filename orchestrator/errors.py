@@ -112,3 +112,50 @@ class TerminalStateError(OrchestratorError):
         self.target = target
         self.status = status
         super().__init__(f"'{target}' is already in terminal state {status}; operation refused")
+
+
+# ================= 工作流组 =================
+class EmptyGroupError(WorkflowValidationError):
+    """提交了不含任何工作流的组。"""
+
+    error_code = "EMPTY_GROUP"
+
+    def __init__(self):
+        super().__init__("workflow group must contain at least one workflow")
+
+
+class DuplicateWorkflowIdInGroupError(WorkflowValidationError):
+    """同一组内工作流 id 重复。"""
+
+    error_code = "DUPLICATE_WORKFLOW_ID"
+
+    def __init__(self, workflow_id: str):
+        self.workflow_id = workflow_id
+        super().__init__(f"duplicate workflow id in group: '{workflow_id}'")
+
+
+class GroupKeyConflictError(OrchestratorError):
+    """组键(幂等键)被复用但提交内容不一致。
+
+    与其它校验失败可区分:HTTP 409 + GROUP_KEY_CONFLICT,
+    并携带 existing_group_id 指向最终落地的那个已有组。
+    """
+
+    error_code = "GROUP_KEY_CONFLICT"
+
+    def __init__(self, existing_group_id: str):
+        self.existing_group_id = existing_group_id
+        super().__init__(
+            f"group idempotency key reused with different content; "
+            f"existing group: '{existing_group_id}'"
+        )
+
+
+class GroupNotFoundError(OrchestratorError):
+    """工作流组不存在。"""
+
+    error_code = "GROUP_NOT_FOUND"
+
+    def __init__(self, group_id: str):
+        self.group_id = group_id
+        super().__init__(f"workflow group not found: '{group_id}'")

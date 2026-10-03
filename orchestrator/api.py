@@ -7,6 +7,11 @@
   GET    /workflows/{wf_id}/tasks/{task_id}  查询单个任务
   POST   /workflows/{wf_id}/cancel  优雅取消(不可逆)
   POST   /workflows/{wf_id}/terminate 立即终止(不可逆)
+  POST   /groups                    整组提交工作流(支持 Idempotency-Key 头)
+  GET    /groups                    列出工作组
+  GET    /groups/{group_id}         查询组(含各成员工作流当前状态)
+  POST   /groups/{group_id}/cancel  组级优雅取消(不可逆,传播到所有未完成成员)
+  POST   /groups/{group_id}/terminate 组级立即终止(不可逆)
   GET    /health                    健康检查
 """
 from __future__ import annotations
@@ -22,7 +27,11 @@ from .errors import (
     CycleDetectedError,
     DuplicateIdempotencyKeyError,
     DuplicateTaskIdError,
+    DuplicateWorkflowIdInGroupError,
+    EmptyGroupError,
     EmptyWorkflowError,
+    GroupKeyConflictError,
+    GroupNotFoundError,
     MissingDependencyError,
     OrchestratorError,
     TaskNotFoundError,
@@ -30,7 +39,7 @@ from .errors import (
     WorkflowNotFoundError,
 )
 from .executor import Executor
-from .models import RetryPolicy, TaskDef
+from .models import GroupState, RetryPolicy, TaskDef, WorkflowDef, WorkflowState
 from .scheduler import Scheduler
 from .service import OrchestratorService
 from .store import JsonStore
@@ -57,6 +66,17 @@ class WorkflowIn(BaseModel):
     workflow_id: str = Field(min_length=1)
     idempotency_key: str | None = None
     tasks: list[TaskIn] = Field(min_length=1)
+
+
+class GroupWorkflowIn(BaseModel):
+    workflow_id: str = Field(min_length=1)
+    tasks: list[TaskIn] = Field(min_length=1)
+
+
+class GroupIn(BaseModel):
+    group_id: str = Field(min_length=1)
+    idempotency_key: str | None = None
+    workflows: list[GroupWorkflowIn] = Field(min_length=1)
 
 
 def _task_to_def(t: TaskIn) -> TaskDef:
@@ -105,6 +125,32 @@ def _wf_to_json(wf) -> dict:
     }
 
 
+def _group_to_json(group: GroupState, members: list[WorkflowState] | None = None) -> dict:
+    payload = {
+        "id": group.id,
+        "status": group.status.value,
+        "idempotency_key": group.idempotency_key,
+        "fingerprint": group.fingerprint,
+        "workflow_ids": group.workflow_ids,
+        "reason": group.reason,
+        "cancel_requested": group.cancel_requested,
+        "cancel_reason": group.cancel_reason,
+        "created_at": group.created_at,
+        "updated_at": group.updated_at,
+        "transitions": group.transitions,
+    }
+    if members is not None:
+        payload["workflows"] = {
+            wf.id: {
+                "status": wf.status.value,
+                "reason": wf.reason,
+                "tasks": {tid: t.status.value for tid, t in wf.tasks.items()},
+            }
+            for wf in members
+        }
+    return payload
+
+
 # ---------------- 默认单例(本地运行) ----------------
 _default: OrchestratorService | None = None
 
@@ -134,6 +180,10 @@ def _error_response(exc: OrchestratorError) -> JSONResponse:
         "WORKFLOW_NOT_FOUND": (404, lambda e: {}),
         "TASK_NOT_FOUND": (404, lambda e: {}),
         "TERMINAL_STATE": (409, lambda e: {"target": e.target, "status": e.status}),
+        "GROUP_KEY_CONFLICT": (409, lambda e: {"existing_group_id": e.existing_group_id}),
+        "GROUP_NOT_FOUND": (404, lambda e: {}),
+        "EMPTY_GROUP": (422, lambda e: {}),
+        "DUPLICATE_WORKFLOW_ID": (422, lambda e: {"workflow_id": e.workflow_id}),
     }
     code = exc.error_code
     http_status, extra_fn = status_codes.get(code, (400, lambda e: {}))
@@ -196,5 +246,38 @@ def create_app(service: OrchestratorService | None = None) -> FastAPI:
     @app.post("/workflows/{wf_id}/terminate")
     async def terminate(wf_id: str) -> dict:
         return _wf_to_json(svc().terminate_workflow(wf_id))
+
+    # ---------------- 工作流组 ----------------
+    @app.post("/groups", status_code=201)
+    async def submit_group(body: GroupIn, idempotency_key: str | None = Header(default=None)) -> dict:
+        key = body.idempotency_key or idempotency_key
+        defs = [
+            WorkflowDef(id=w.workflow_id, tasks=[_task_to_def(t) for t in w.tasks])
+            for w in body.workflows
+        ]
+        group = svc().submit_group(body.group_id, defs, key)
+        return _group_to_json(group)
+
+    @app.get("/groups")
+    async def list_groups() -> dict:
+        return {
+            "groups": [
+                {"id": g.id, "status": g.status.value, "workflow_ids": g.workflow_ids}
+                for g in svc().list_groups()
+            ]
+        }
+
+    @app.get("/groups/{group_id}")
+    async def get_group(group_id: str) -> dict:
+        group, members = svc().get_group_view(group_id)
+        return _group_to_json(group, members)
+
+    @app.post("/groups/{group_id}/cancel")
+    async def cancel_group(group_id: str) -> dict:
+        return _group_to_json(svc().cancel_group(group_id))
+
+    @app.post("/groups/{group_id}/terminate")
+    async def terminate_group(group_id: str) -> dict:
+        return _group_to_json(svc().terminate_group(group_id))
 
     return app

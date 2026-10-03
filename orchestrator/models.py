@@ -60,6 +60,32 @@ _WF_TERMINAL = frozenset(
 )
 
 
+class GroupStatus(str, Enum):
+    """工作流组状态机:
+
+    PENDING  -> RUNNING -> SUCCEEDED / FAILED / CANCELLED
+    后三者均为不可逆终态。组只有在【全部成员工作流到达终态】后才推进到自己的终态:
+      - 全部成员 SUCCEEDED            -> 组 SUCCEEDED
+      - 任一成员 FAILED(或存在非成功终态) -> 组 FAILED,reason 列出失败成员
+      - 组级取消/终止生效后全部成员终态   -> 组 CANCELLED
+    """
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in _GROUP_TERMINAL
+
+
+_GROUP_TERMINAL = frozenset(
+    {GroupStatus.SUCCEEDED, GroupStatus.FAILED, GroupStatus.CANCELLED}
+)
+
+
 @dataclass
 class RetryPolicy:
     """指数退避重试策略。"""
@@ -105,6 +131,24 @@ class TaskDef:
             dependencies=list(d.get("dependencies") or []),
             retryable=bool(d.get("retryable", True)),
             retry_policy=RetryPolicy(**(d.get("retry_policy") or {})),
+        )
+
+
+@dataclass
+class WorkflowDef:
+    """组提交时单个成员工作流的定义(id + 任务图)。"""
+
+    id: str
+    tasks: list[TaskDef] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "tasks": [t.to_dict() for t in self.tasks]}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkflowDef":
+        return cls(
+            id=d["id"],
+            tasks=[TaskDef.from_dict(td) for td in (d.get("tasks") or [])],
         )
 
 
@@ -197,6 +241,58 @@ class WorkflowState:
             idempotency_key=d.get("idempotency_key"),
             tasks={tid: TaskState.from_dict(td) for tid, td in (d.get("tasks") or {}).items()},
             status=WorkflowStatus(d["status"]),
+            created_at=float(d.get("created_at", 0.0)),
+            updated_at=float(d.get("updated_at", 0.0)),
+            reason=d.get("reason"),
+            cancel_requested=bool(d.get("cancel_requested", False)),
+            cancel_reason=d.get("cancel_reason"),
+            transitions=list(d.get("transitions") or []),
+        )
+
+
+@dataclass
+class GroupState:
+    """工作流组运行时状态。
+
+    fingerprint: 组提交内容(成员工作流定义)的规范哈希,用于区分
+    "同一组键重复提交同一内容"(幂等返回)与"组键复用但内容不一致"(拒绝)。
+    """
+
+    id: str
+    idempotency_key: str | None = None
+    fingerprint: str = ""
+    workflow_ids: list[str] = field(default_factory=list)
+    status: GroupStatus = GroupStatus.PENDING
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    reason: str | None = None
+    cancel_requested: bool = False
+    cancel_reason: str | None = None
+    transitions: list[dict] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "idempotency_key": self.idempotency_key,
+            "fingerprint": self.fingerprint,
+            "workflow_ids": list(self.workflow_ids),
+            "status": self.status.value,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "reason": self.reason,
+            "cancel_requested": self.cancel_requested,
+            "cancel_reason": self.cancel_reason,
+            "transitions": self.transitions,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GroupState":
+        return cls(
+            id=d["id"],
+            idempotency_key=d.get("idempotency_key"),
+            fingerprint=str(d.get("fingerprint") or ""),
+            workflow_ids=list(d.get("workflow_ids") or []),
+            status=GroupStatus(d["status"]),
             created_at=float(d.get("created_at", 0.0)),
             updated_at=float(d.get("updated_at", 0.0)),
             reason=d.get("reason"),

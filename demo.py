@@ -90,6 +90,44 @@ def main() -> None:
         print(f"rejected missing dep: code={exc.error_code} "
               f"task={exc.task_id} missing={exc.missing_dependency}")
 
+    # ---- 工作流组:整组提交 + 组键防重 + 成员失败时组级收敛 ----
+    from orchestrator.errors import GroupKeyConflictError
+    from orchestrator.models import WorkflowDef
+
+    group_members = [
+        WorkflowDef(id="demo-ok", tasks=[TaskDef(id="t1", action="pass")]),
+        WorkflowDef(
+            id="demo-bad",
+            tasks=[
+                TaskDef(id="boom", action="fail", params={"kind": "non_retryable"}),
+                TaskDef(id="after", action="pass", dependencies=["boom"]),
+            ],
+        ),
+    ]
+    g = svc.submit_group("demo-group", group_members, idempotency_key="demo-group-key")
+    # 同一组键并发/重复提交:返回同一个组,不重复创建
+    g_again = svc.submit_group("demo-group", group_members, idempotency_key="demo-group-key")
+    assert g_again is g
+    print("\nduplicate group submission with same key -> same group object, no re-run")
+    # 组键复用但内容不一致:可区分的拒绝,并指向已有组
+    try:
+        svc.submit_group(
+            "other-group",
+            [WorkflowDef(id="wf-x", tasks=[TaskDef(id="x", action="pass")])],
+            idempotency_key="demo-group-key",
+        )
+    except GroupKeyConflictError as exc:
+        print(f"rejected group key conflict: code={exc.error_code} existing={exc.existing_group_id}")
+
+    deadline = time.time() + 10
+    while time.time() < deadline and not svc.get_group("demo-group").status.is_terminal:
+        time.sleep(0.05)
+    g_done, members = svc.get_group_view("demo-group")
+    print(f"\n=== group={g_done.id} status={g_done.status.value} ===")
+    print("reason:", g_done.reason)
+    for m in members:
+        print(f"  member={m.id:<9} status={m.status.value:<9} reason={m.reason}")
+
     sch.stop()
 
     # ---- 进程 2:用同一状态文件"重启",恢复后结论一致 ----
@@ -102,6 +140,11 @@ def main() -> None:
     assert wf2.status.value == "SUCCEEDED"
     assert wf2.tasks["fetch"].attempt == 1
     assert wf2.tasks["wobbly"].attempt == 3  # 重启后没有重跑
+    # 组的终态与成员结论在重启后保持一致
+    g2 = svc2.get_group("demo-group")
+    print(f"\nafter restart: group={g2.id} status={g2.status.value}")
+    print("reason:", g2.reason)
+    assert g2.status.value == "FAILED"
     print("\nstate file:", STATE)
     print("DEMO OK")
     sch2.stop()
