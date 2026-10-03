@@ -60,6 +60,32 @@ _WF_TERMINAL = frozenset(
 )
 
 
+class GroupStatus(str, Enum):
+    """工作流组状态机:
+
+    PENDING  -> RUNNING -> SUCCEEDED / FAILED / CANCELLED
+    后三者均为不可逆终态。组只有在【全部成员工作流到达终态】后才收敛:
+      - 全部成员 SUCCEEDED            -> SUCCEEDED
+      - 组级取消/终止已生效           -> CANCELLED(终态操作,不可逆)
+      - 其余情况(有成员 FAILED/CANCELLED) -> FAILED,reason 给出导致结论的成员
+    """
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in _GROUP_TERMINAL
+
+
+_GROUP_TERMINAL = frozenset(
+    {GroupStatus.SUCCEEDED, GroupStatus.FAILED, GroupStatus.CANCELLED}
+)
+
+
 @dataclass
 class RetryPolicy:
     """指数退避重试策略。"""
@@ -157,6 +183,67 @@ class TaskState:
             started_at=d.get("started_at"),
             finished_at=d.get("finished_at"),
             result=d.get("result"),
+            transitions=list(d.get("transitions") or []),
+        )
+
+
+@dataclass
+class GroupWorkflowDef:
+    """组提交中单个工作流的定义。"""
+
+    workflow_id: str
+    tasks: list[TaskDef] = field(default_factory=list)
+    idempotency_key: str | None = None
+
+
+@dataclass
+class WorkflowGroupState:
+    """工作流组运行时状态。
+
+    spec_hash: 组提交内容(成员工作流定义)的规范化指纹,
+    用于组键防重:同键同内容 -> 幂等返回;同键不同内容 -> 明确拒绝。
+    """
+
+    id: str
+    group_key: str | None = None
+    spec_hash: str = ""
+    workflow_ids: list[str] = field(default_factory=list)
+    status: GroupStatus = GroupStatus.PENDING
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    reason: str | None = None
+    cancel_requested: bool = False
+    cancel_reason: str | None = None
+    transitions: list[dict] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "group_key": self.group_key,
+            "spec_hash": self.spec_hash,
+            "workflow_ids": list(self.workflow_ids),
+            "status": self.status.value,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "reason": self.reason,
+            "cancel_requested": self.cancel_requested,
+            "cancel_reason": self.cancel_reason,
+            "transitions": self.transitions,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WorkflowGroupState":
+        return cls(
+            id=d["id"],
+            group_key=d.get("group_key"),
+            spec_hash=str(d.get("spec_hash") or ""),
+            workflow_ids=list(d.get("workflow_ids") or []),
+            status=GroupStatus(d["status"]),
+            created_at=float(d.get("created_at", 0.0)),
+            updated_at=float(d.get("updated_at", 0.0)),
+            reason=d.get("reason"),
+            cancel_requested=bool(d.get("cancel_requested", False)),
+            cancel_reason=d.get("cancel_reason"),
             transitions=list(d.get("transitions") or []),
         )
 

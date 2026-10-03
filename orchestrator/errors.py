@@ -112,3 +112,60 @@ class TerminalStateError(OrchestratorError):
         self.target = target
         self.status = status
         super().__init__(f"'{target}' is already in terminal state {status}; operation refused")
+
+
+# ================= 工作流组 =================
+class EmptyGroupError(WorkflowValidationError):
+    """提交了不含任何工作流的组。"""
+
+    error_code = "EMPTY_GROUP"
+
+    def __init__(self):
+        super().__init__("group must contain at least one workflow")
+
+
+class DuplicateWorkflowIdError(WorkflowValidationError):
+    """同一次组提交中工作流 id 重复。"""
+
+    error_code = "DUPLICATE_WORKFLOW_ID"
+
+    def __init__(self, workflow_id: str):
+        self.workflow_id = workflow_id
+        super().__init__(f"duplicate workflow id in group submission: '{workflow_id}'")
+
+
+class WorkflowIdConflictError(OrchestratorError):
+    """组内工作流 id 与已有工作流冲突:整组拒绝,不产生任何持久化。"""
+
+    error_code = "WORKFLOW_ID_CONFLICT"
+
+    def __init__(self, workflow_id: str):
+        self.workflow_id = workflow_id
+        super().__init__(f"workflow id already exists: '{workflow_id}'")
+
+
+class GroupKeyConflictError(OrchestratorError):
+    """组键被复用但提交内容不一致:拒绝并指出已落地的组。
+
+    与校验失败(4xx 语义)可区分:这是幂等/防重冲突,调用方可通过
+    existing_group_id 取回已存在的组。
+    """
+
+    error_code = "GROUP_KEY_CONFLICT"
+
+    def __init__(self, existing_group_id: str):
+        self.existing_group_id = existing_group_id
+        super().__init__(
+            f"group key reused with different content; "
+            f"submission already landed on group '{existing_group_id}'"
+        )
+
+
+class GroupNotFoundError(OrchestratorError):
+    """工作流组不存在。"""
+
+    error_code = "GROUP_NOT_FOUND"
+
+    def __init__(self, group_id: str):
+        self.group_id = group_id
+        super().__init__(f"workflow group not found: '{group_id}'")
