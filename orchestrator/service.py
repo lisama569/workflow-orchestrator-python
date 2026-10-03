@@ -271,6 +271,19 @@ class OrchestratorService:
         self.scheduler.request_terminate(workflow_id)
         return self.get_workflow(workflow_id)
 
+    # ================= 组级取消 / 终止 =================
+    def cancel_group(self, group_id: str) -> WorkflowGroupState:
+        self.get_group(group_id)  # 不存在 -> GroupNotFoundError
+        self.scheduler.request_group_cancel(group_id)
+        return self.get_group(group_id)
+
+    def terminate_group(self, group_id: str) -> WorkflowGroupState:
+        group = self.get_group(group_id)
+        if group.status == GroupStatus.CANCELLED:
+            return group  # 终态不可逆:重复终止幂等返回
+        self.scheduler.request_group_terminate(group_id)
+        return self.get_group(group_id)
+
     # ================= 构造 =================
     @staticmethod
     def build_state(

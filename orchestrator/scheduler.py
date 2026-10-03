@@ -16,9 +16,17 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 
+from .errors import TerminalStateError
 from .executor import ExecutionResult, Executor, FailureKind, TaskCancelled
 from .logging_setup import log_transition
-from .models import TaskState, TaskStatus, WorkflowState, WorkflowStatus
+from .models import (
+    GroupStatus,
+    TaskState,
+    TaskStatus,
+    WorkflowGroupState,
+    WorkflowState,
+    WorkflowStatus,
+)
 from .store import JsonStore
 
 logger = logging.getLogger("orchestrator.scheduler")
@@ -114,6 +122,16 @@ class Scheduler:
                 wf.updated_at = now
                 self.store.save_workflow(wf)
                 logger.info("recovery: workflow=%s reopened, pending rerun of crashed tasks", wf_id)
+        for gid, g in self.store.load_groups().items():
+            if g.status.is_terminal:
+                logger.info("recovery: group=%s kept terminal status=%s", gid, g.status.value)
+            else:
+                # 组结论由成员状态 + 持久化的取消标志确定性推导,tick 会继续收敛
+                logger.info(
+                    "recovery: group=%s status=%s will be re-evaluated from member states",
+                    gid,
+                    g.status.value,
+                )
 
     def notify(self) -> None:
         self._wake_event.set()
@@ -144,24 +162,8 @@ class Scheduler:
                     logger.info("workflow=%s cancel is already effective; idempotent no-op", workflow_id)
                     return
                 if wf.status.is_terminal:
-                    from .errors import TerminalStateError
-
                     raise TerminalStateError(workflow_id, wf.status.value)
-                wf.cancel_requested = True
-                wf.cancel_reason = reason
-                wf.updated_at = now
-                self._set_wf(wf, WorkflowStatus.RUNNING, f"cancel accepted: {reason}", now)
-                for t in wf.tasks.values():
-                    if t.status == TaskStatus.PENDING:
-                        self._set_task(
-                            t,
-                            TaskStatus.CANCELLED,
-                            "workflow cancel requested before task started",
-                            now,
-                        )
-                if force_terminal:
-                    # 终止:工作流立即终态;在执行任务的结果稍后一律按 CANCELLED 收敛。
-                    self._set_wf(wf, WorkflowStatus.CANCELLED, f"terminated: {reason}", now)
+                self._apply_cancel_to_wf(wf, reason, force_terminal, now)
                 inflights = [
                     inf for (wid, _tid), inf in list(self._running.items()) if wid == workflow_id
                 ]
@@ -175,6 +177,86 @@ class Scheduler:
                 )
 
         self.store.mutate(workflow_id, _apply)
+        self.notify()
+
+    def _apply_cancel_to_wf(
+        self, wf: WorkflowState, reason: str, force_terminal: bool, now: float
+    ) -> None:
+        """对单个工作流应用取消/终止的纯状态变更(调用方保证持锁与落盘)。
+
+        未开始任务立即 CANCELLED;force_terminal 时工作流立即进入 CANCELLED 终态,
+        在执行任务的结果稍后一律按 CANCELLED 收敛。已终态工作流不应传入。
+        """
+        wf.cancel_requested = True
+        wf.cancel_reason = reason
+        wf.updated_at = now
+        self._set_wf(wf, WorkflowStatus.RUNNING, f"cancel accepted: {reason}", now)
+        for t in wf.tasks.values():
+            if t.status == TaskStatus.PENDING:
+                self._set_task(
+                    t,
+                    TaskStatus.CANCELLED,
+                    "workflow cancel requested before task started",
+                    now,
+                )
+        if force_terminal:
+            # 终止:工作流立即终态;在执行任务的结果稍后一律按 CANCELLED 收敛。
+            self._set_wf(wf, WorkflowStatus.CANCELLED, f"terminated: {reason}", now)
+
+    # ================= 组级控制面 =================
+    def request_group_cancel(self, group_id: str, reason: str = "cancel requested by client") -> None:
+        """组级优雅取消(不可逆):作用到组内所有尚未完成的工作流,重复调用幂等。"""
+        self._request_group_cancel(group_id, reason, force_terminal=False)
+
+    def request_group_terminate(self, group_id: str, reason: str = "terminate requested by client") -> None:
+        """组级立即终止(不可逆):组与未完成的成员立即进入终态,重复调用幂等。"""
+        self._request_group_cancel(group_id, reason, force_terminal=True)
+
+    def _request_group_cancel(self, group_id: str, reason: str, force_terminal: bool) -> None:
+        now = time.time()
+        affected: list[str] = []
+
+        def _txn(
+            wfs: dict[str, WorkflowState], groups: dict[str, WorkflowGroupState]
+        ) -> None:
+            g = groups.get(group_id)
+            if g is None:
+                raise KeyError(group_id)  # 服务层已先校验存在
+            if g.status == GroupStatus.CANCELLED or g.cancel_requested:
+                logger.info("group=%s cancel is already effective; idempotent no-op", group_id)
+                return
+            if g.status.is_terminal:
+                raise TerminalStateError(group_id, g.status.value)
+            g.cancel_requested = True
+            g.cancel_reason = reason
+            g.updated_at = now
+            self._set_group(g, GroupStatus.RUNNING, f"cancel accepted: {reason}", now)
+            member_reason = f"group {group_id} cancel: {reason}"
+            for wid in g.workflow_ids:
+                wf = wfs.get(wid)
+                # 已终态成员(如已 SUCCEEDED)原样保留,绝不影响其结论
+                if wf is None or wf.status.is_terminal or wf.cancel_requested:
+                    continue
+                self._apply_cancel_to_wf(wf, member_reason, force_terminal, now)
+                affected.append(wid)
+            if force_terminal:
+                # 终止:组立即终态;成员在执行任务的结果稍后一律按 CANCELLED 收敛。
+                self._set_group(g, GroupStatus.CANCELLED, f"terminated: {reason}", now)
+                g.reason = reason
+
+        self.store.transact(_txn)
+        # 状态已落盘,再给成员的在执行任务发中断信号
+        with self._running_lock:
+            inflights = [inf for (wid, _), inf in self._running.items() if wid in affected]
+        for inf in inflights:
+            inf.cancel_event.set()
+        logger.info(
+            "group=%s %s; %d member workflow(s) affected, %d in-flight task(s) signalled",
+            group_id,
+            "terminated" if force_terminal else "cancelled",
+            len(affected),
+            len(inflights),
+        )
         self.notify()
 
     # ================= 调度面 =================
@@ -197,9 +279,69 @@ class Scheduler:
             # 状态已先落盘,再派发执行(执行中崩溃最坏只是重复一次未完成任务)
             for t, inf in launches:
                 self._submit(wf_id, t, inf, now)
+        self._tick_groups(now)
+
+    # ---------- 组级推进:全部成员终态后组才收敛 ----------
+    def _tick_groups(self, now: float) -> None:
+        for gid in sorted(self.store.load_groups().keys()):
+            def _scan(
+                wfs: dict[str, WorkflowState], groups: dict[str, WorkflowGroupState]
+            ) -> None:
+                g = groups.get(gid)
+                if g is None or g.status.is_terminal:
+                    return
+                members = [wfs[wid] for wid in g.workflow_ids if wid in wfs]
+                if g.cancel_requested:
+                    # 崩溃恢复缺口:组取消已持久化但个别成员尚未应用,这里确定性补齐
+                    for wf in members:
+                        if not wf.status.is_terminal and not wf.cancel_requested:
+                            self._apply_cancel_to_wf(
+                                wf,
+                                f"group {gid} cancel: {g.cancel_reason}",
+                                False,
+                                now,
+                            )
+                if g.status == GroupStatus.PENDING:
+                    self._set_group(g, GroupStatus.RUNNING, "scheduler picked up group", now)
+                self._conclude_group(g, members, now)
+                g.updated_at = now
+
+            self.store.transact(_scan)
+
+    def _conclude_group(
+        self, g: WorkflowGroupState, members: list[WorkflowState], now: float
+    ) -> None:
+        """组结论的确定规则(只在全部成员到达终态后评估):
+
+        - 组级取消已生效            -> CANCELLED;
+        - 全部成员 SUCCEEDED        -> SUCCEEDED;
+        - 其余(有成员 FAILED/CANCELLED) -> FAILED,reason 列出导致结论的成员及其原因。
+        """
+        if g.status.is_terminal or not members:
+            return
+        if any(not wf.status.is_terminal for wf in members):
+            return  # 还有成员未结束
+        if g.cancel_requested:
+            self._set_group(g, GroupStatus.CANCELLED, f"cancelled: {g.cancel_reason}", now)
+            g.reason = g.cancel_reason
+            return
+        not_ok = [wf for wf in members if wf.status != WorkflowStatus.SUCCEEDED]
+        if not not_ok:
+            self._set_group(
+                g, GroupStatus.SUCCEEDED, f"all {len(members)} workflow(s) succeeded", now
+            )
+            g.reason = None
+            return
+        details = "; ".join(
+            f"{wf.id}={wf.status.value}({wf.reason or 'no reason'})"
+            for wf in sorted(not_ok, key=lambda w: w.id)
+        )
+        reason = f"member workflow(s) not succeeded: {details}"
+        self._set_group(g, GroupStatus.FAILED, reason, now)
+        g.reason = reason
 
     def run_until_idle(self, timeout: float = 10.0) -> None:
-        """测试/本地工具:反复 tick 直到没有在执行与待执行任务。"""
+        """测试/本地工具:反复 tick 直到没有在执行与待执行任务、组全部收敛。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.tick()
@@ -208,6 +350,9 @@ class Scheduler:
                 if wf.status.is_terminal:
                     continue
                 if any(t.status in (TaskStatus.RUNNING, TaskStatus.PENDING) for t in wf.tasks.values()):
+                    pending = True
+            for g in self.store.load_groups().values():
+                if not g.status.is_terminal:
                     pending = True
             with self._running_lock:
                 busy = bool(self._running)
@@ -345,15 +490,15 @@ class Scheduler:
                 result = ExecutionResult.fail(
                     FailureKind.NON_RETRYABLE, f"executor crashed: {exc!r}", "EXECUTOR_CRASHED"
                 )
+            # 锁顺序约定:一律 工作流锁 -> 存储锁(与 tick / request_cancel 一致),
+            # 否则完成回调(存储锁->工作流锁)与 tick(工作流锁->存储锁)会 AB-BA 死锁。
             wf_lock = self._lock_for(wf_id)
-            try:
+            with wf_lock:
                 self.store.mutate(
                     wf_id, lambda wf: self._apply_result(wf, t.id, inf.attempt, result, now0=time.time())
                 )
-            finally:
-                wf_lock  # 锁在 mutate 内部获取;此处仅保持引用清晰
-                with self._running_lock:
-                    self._running.pop((wf_id, t.id), None)
+            with self._running_lock:
+                self._running.pop((wf_id, t.id), None)
             self.notify()
 
         inf.future = self._pool.submit(_work)
@@ -366,62 +511,63 @@ class Scheduler:
         result: ExecutionResult,
         now0: float,
     ) -> None:
-        """在 wf 锁 + 存储锁内应用一次执行结论,并立即传播/收敛/落盘。"""
-        lock = self._lock_for(wf.id)
-        with lock:
-            t = wf.tasks[task_id]
-            if t.status != TaskStatus.RUNNING or t.attempt != attempt:
-                logger.info(
-                    "task=%s stale completion ignored (status=%s attempt=%s vs %s)",
-                    task_id,
-                    t.status.value,
-                    t.attempt,
-                    attempt,
-                )
-                return
-            # 终止优先:无论执行结果如何,运行中的任务一律 CANCELLED(终态不可逆)
-            if wf.cancel_requested and result.error_type == "CANCELLED":
-                self._finish_task(t, TaskStatus.CANCELLED, "interrupted by workflow termination", now0)
-            elif wf.cancel_requested:
-                self._finish_task(
-                    t, TaskStatus.CANCELLED, "workflow terminated; execution result discarded", now0
-                )
-            elif result.success:
-                t.result = result.output
-                self._finish_task(t, TaskStatus.SUCCEEDED, f"attempt {attempt} succeeded", now0)
-            elif result.kind == FailureKind.NON_RETRYABLE:
-                t.error = result.error
-                t.error_type = result.error_type
+        """在 wf 锁 + 存储锁内应用一次执行结论,并立即传播/收敛/落盘。
+
+        调用方(_work)已持有该工作流的锁,此处不再重复获取。
+        """
+        t = wf.tasks[task_id]
+        if t.status != TaskStatus.RUNNING or t.attempt != attempt:
+            logger.info(
+                "task=%s stale completion ignored (status=%s attempt=%s vs %s)",
+                task_id,
+                t.status.value,
+                t.attempt,
+                attempt,
+            )
+            return
+        # 终止优先:无论执行结果如何,运行中的任务一律 CANCELLED(终态不可逆)
+        if wf.cancel_requested and result.error_type == "CANCELLED":
+            self._finish_task(t, TaskStatus.CANCELLED, "interrupted by workflow termination", now0)
+        elif wf.cancel_requested:
+            self._finish_task(
+                t, TaskStatus.CANCELLED, "workflow terminated; execution result discarded", now0
+            )
+        elif result.success:
+            t.result = result.output
+            self._finish_task(t, TaskStatus.SUCCEEDED, f"attempt {attempt} succeeded", now0)
+        elif result.kind == FailureKind.NON_RETRYABLE:
+            t.error = result.error
+            t.error_type = result.error_type
+            self._finish_task(
+                t,
+                TaskStatus.FAILED,
+                f"non-retryable failure: [{result.error_type}] {result.error}",
+                now0,
+            )
+        else:  # RETRYABLE
+            t.error = result.error
+            t.error_type = result.error_type
+            if attempt >= t.max_attempts:
                 self._finish_task(
                     t,
                     TaskStatus.FAILED,
-                    f"non-retryable failure: [{result.error_type}] {result.error}",
+                    f"retry budget exhausted after {attempt} attempt(s): {result.error}",
                     now0,
                 )
-            else:  # RETRYABLE
-                t.error = result.error
-                t.error_type = result.error_type
-                if attempt >= t.max_attempts:
-                    self._finish_task(
-                        t,
-                        TaskStatus.FAILED,
-                        f"retry budget exhausted after {attempt} attempt(s): {result.error}",
-                        now0,
-                    )
-                else:
-                    delay = t.retry_policy.delay_for_attempt(attempt)
-                    t.next_run_at = now0 + delay
-                    t.started_at = None
-                    self._set_task(
-                        t,
-                        TaskStatus.PENDING,
-                        f"retryable failure [{t.error_type}] {t.error}; "
-                        f"backoff {delay:.3f}s then retry {attempt + 1}/{t.max_attempts}",
-                        now0,
-                    )
-            self._propagate(wf, now0)
-            self._conclude(wf, now0)
-            wf.updated_at = now0
+            else:
+                delay = t.retry_policy.delay_for_attempt(attempt)
+                t.next_run_at = now0 + delay
+                t.started_at = None
+                self._set_task(
+                    t,
+                    TaskStatus.PENDING,
+                    f"retryable failure [{t.error_type}] {t.error}; "
+                    f"backoff {delay:.3f}s then retry {attempt + 1}/{t.max_attempts}",
+                    now0,
+                )
+        self._propagate(wf, now0)
+        self._conclude(wf, now0)
+        wf.updated_at = now0
 
     # ================= 辅助 =================
     def _lock_for(self, wf_id: str) -> threading.Lock:
@@ -456,6 +602,16 @@ class Scheduler:
         entry = {"ts": now, "from": frm.value, "to": to.value, "reason": reason}
         wf.transitions.append(entry)
         logger.info("workflow=%s transition %s->%s reason=%s", wf.id, frm.value, to.value, reason)
+
+    @staticmethod
+    def _set_group(g: WorkflowGroupState, to: GroupStatus, reason: str, now: float) -> None:
+        frm = g.status
+        if frm == to:
+            return
+        g.status = to
+        entry = {"ts": now, "from": frm.value, "to": to.value, "reason": reason}
+        g.transitions.append(entry)
+        logger.info("group=%s transition %s->%s reason=%s", g.id, frm.value, to.value, reason)
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
