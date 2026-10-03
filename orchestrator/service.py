@@ -1,6 +1,8 @@
 """门面服务:校验提交、幂等去重、查询、取消与终止。"""
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 
@@ -8,13 +10,28 @@ from .errors import (
     CycleDetectedError,
     DuplicateIdempotencyKeyError,
     DuplicateTaskIdError,
+    DuplicateWorkflowIdError,
+    EmptyGroupError,
     EmptyWorkflowError,
+    GroupKeyConflictError,
+    GroupNotFoundError,
     MissingDependencyError,
     TaskNotFoundError,
     TerminalStateError,
+    WorkflowIdConflictError,
     WorkflowNotFoundError,
 )
-from .models import RetryPolicy, TaskDef, TaskState, TaskStatus, WorkflowState, WorkflowStatus
+from .models import (
+    GroupStatus,
+    GroupWorkflowDef,
+    RetryPolicy,
+    TaskDef,
+    TaskState,
+    TaskStatus,
+    WorkflowGroupState,
+    WorkflowState,
+    WorkflowStatus,
+)
 from .scheduler import Scheduler
 from .store import JsonStore
 
@@ -71,6 +88,113 @@ class OrchestratorService:
         )
         self.scheduler.notify()
         return wf
+
+    # ================= 组提交 =================
+    def submit_group(
+        self,
+        group_id: str,
+        workflows: list[GroupWorkflowDef],
+        group_key: str | None = None,
+    ) -> WorkflowGroupState:
+        """一次提交一组工作流。
+
+        - 校验(空组/组内工作流 id 重复/各工作流任务图)全部通过后才触碰存储,
+          校验失败即整组拒绝,不产生任何持久化;
+        - 组 + 全部成员工作流在一次 store 事务内落盘:要么全部生效,要么不生效;
+        - group_key 防重:同键同内容 -> 幂等返回已落地的组(不重复建工作流);
+          同键不同内容 -> GroupKeyConflictError(可与校验失败区分),
+          并携带 existing_group_id 指明最终落到的组。
+        """
+        workflows = list(workflows or [])
+        self.validate_group(workflows)
+        spec_hash = self.group_spec_hash(workflows)
+        now = time.time()
+
+        def _txn(
+            wfs: dict[str, WorkflowState], groups: dict[str, WorkflowGroupState]
+        ) -> WorkflowGroupState:
+            existing = groups.get(group_id)
+            if existing is None and group_key is not None:
+                existing = next(
+                    (g for g in groups.values() if g.group_key == group_key), None
+                )
+            if existing is not None:
+                if existing.spec_hash == spec_hash and existing.group_key == group_key:
+                    logger.info(
+                        "duplicate group submission ignored: group=%s group_key=%s -> existing group",
+                        existing.id,
+                        group_key,
+                    )
+                    return existing
+                raise GroupKeyConflictError(existing.id)
+            for w in workflows:
+                if w.workflow_id in wfs:
+                    raise WorkflowIdConflictError(w.workflow_id)
+            group = WorkflowGroupState(
+                id=group_id,
+                group_key=group_key,
+                spec_hash=spec_hash,
+                workflow_ids=[w.workflow_id for w in workflows],
+                status=GroupStatus.PENDING,
+                created_at=now,
+                updated_at=now,
+            )
+            groups[group.id] = group
+            for w in workflows:
+                wfs[w.workflow_id] = self.build_state(
+                    w.workflow_id, w.tasks, w.idempotency_key, now
+                )
+            return group
+
+        group = self.store.transact(_txn)
+        logger.info(
+            "group=%s accepted: %d workflow(s) %s, group_key=%s",
+            group.id,
+            len(workflows),
+            [w.workflow_id for w in workflows],
+            group_key,
+        )
+        self.scheduler.notify()
+        return group
+
+    @staticmethod
+    def validate_group(workflows: list[GroupWorkflowDef]) -> None:
+        """组级校验:纯函数,失败即整组拒绝,与存储无关。"""
+        if not workflows:
+            raise EmptyGroupError()
+        ids = [w.workflow_id for w in workflows]
+        if len(set(ids)) != len(ids):
+            dup = next(i for i in ids if ids.count(i) > 1)
+            raise DuplicateWorkflowIdError(dup)
+        for w in workflows:
+            OrchestratorService.validate(list(w.tasks or []))
+
+    @staticmethod
+    def group_spec_hash(workflows: list[GroupWorkflowDef]) -> str:
+        """组提交内容的规范化指纹:与成员顺序无关,内容一致则指纹一致。"""
+        payload = [
+            {
+                "workflow_id": w.workflow_id,
+                "idempotency_key": w.idempotency_key,
+                "tasks": [t.to_dict() for t in w.tasks],
+            }
+            for w in sorted(workflows, key=lambda x: x.workflow_id)
+        ]
+        blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    # ================= 组查询 =================
+    def get_group(self, group_id: str) -> WorkflowGroupState:
+        group = self.store.get_group(group_id)
+        if group is None:
+            raise GroupNotFoundError(group_id)
+        return group
+
+    def get_group_members(self, group_id: str) -> dict[str, WorkflowState]:
+        """按组查询组内各工作流的当前状态(保持组内提交顺序)。"""
+        group = self.get_group(group_id)
+        all_wfs = self.store.load_all()
+        return {wid: all_wfs[wid] for wid in group.workflow_ids if wid in all_wfs}
 
     # ================= 校验 =================
     @staticmethod
