@@ -11,8 +11,9 @@ import os
 import tempfile
 import time
 
+from orchestrator.errors import GroupKeyConflictError
 from orchestrator.executor import Executor
-from orchestrator.models import RetryPolicy, TaskDef
+from orchestrator.models import GroupWorkflowDef, RetryPolicy, TaskDef
 from orchestrator.scheduler import Scheduler
 from orchestrator.service import OrchestratorService
 from orchestrator.store import JsonStore
@@ -90,6 +91,63 @@ def main() -> None:
         print(f"rejected missing dep: code={exc.error_code} "
               f"task={exc.task_id} missing={exc.missing_dependency}")
 
+    # ---- 工作流组:一次提交一批,组键防重,组级收敛 ----
+    group = svc.submit_group(
+        "demo-batch",
+        [
+            GroupWorkflowDef(
+                workflow_id="etl-users",
+                tasks=[TaskDef(id="extract", action="pass"),
+                       TaskDef(id="load", action="pass", dependencies=["extract"])],
+            ),
+            GroupWorkflowDef(
+                workflow_id="etl-orders",
+                tasks=[TaskDef(id="extract", action="fail",
+                               params={"kind": "non_retryable", "message": "source unavailable"}),
+                       TaskDef(id="load", action="pass", dependencies=["extract"])],
+            ),
+        ],
+        group_key="batch-2026-10-03",
+    )
+    # 同键同内容重复提交 -> 幂等返回同一个组;同键不同内容 -> 明确拒绝
+    replay = svc.submit_group(
+        "demo-batch-retry",
+        [
+            GroupWorkflowDef(
+                workflow_id="etl-users",
+                tasks=[TaskDef(id="extract", action="pass"),
+                       TaskDef(id="load", action="pass", dependencies=["extract"])],
+            ),
+            GroupWorkflowDef(
+                workflow_id="etl-orders",
+                tasks=[TaskDef(id="extract", action="fail",
+                               params={"kind": "non_retryable", "message": "source unavailable"}),
+                       TaskDef(id="load", action="pass", dependencies=["extract"])],
+            ),
+        ],
+        group_key="batch-2026-10-03",
+    )
+    assert replay.id == group.id
+    print("duplicate group submission with same group key -> same group, members created once")
+    try:
+        svc.submit_group(
+            "demo-batch-other",
+            [GroupWorkflowDef(workflow_id="etl-x", tasks=[TaskDef(id="t", action="pass")])],
+            group_key="batch-2026-10-03",
+        )
+    except GroupKeyConflictError as exc:
+        print(f"rejected reused group key: code={exc.error_code} "
+              f"existing_group={exc.existing_group_id}")
+
+    deadline = time.time() + 10
+    while time.time() < deadline and not svc.get_group("demo-batch").status.is_terminal:
+        time.sleep(0.05)
+    group = svc.get_group("demo-batch")
+    print(f"\n=== group={group.id} status={group.status.value} ===")
+    print("reason:", group.reason)
+    for wid, w in svc.get_group_members("demo-batch").items():
+        print(f"  member={wid:<12} status={w.status.value}")
+
     sch.stop()
 
     # ---- 进程 2:用同一状态文件"重启",恢复后结论一致 ----
@@ -102,6 +160,12 @@ def main() -> None:
     assert wf2.status.value == "SUCCEEDED"
     assert wf2.tasks["fetch"].attempt == 1
     assert wf2.tasks["wobbly"].attempt == 3  # 重启后没有重跑
+    g2 = svc2.get_group("demo-batch")
+    print(f"\n=== after restart: group={g2.id} status={g2.status.value} ===")
+    print("reason:", g2.reason)
+    assert g2.status.value == "FAILED"  # 组终态与成员结论跨重启不丢失
+    assert svc2.get_workflow("etl-users").status.value == "SUCCEEDED"
+    assert svc2.get_workflow("etl-users").tasks["extract"].attempt == 1  # 成功成员不重跑
     print("\nstate file:", STATE)
     print("DEMO OK")
     sch2.stop()

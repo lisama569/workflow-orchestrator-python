@@ -6,6 +6,7 @@
 - 纯 Python 3.14 + FastAPI,无外部数据库 / 消息队列依赖
 - 状态原子落盘(临时文件 + `os.replace` + fsync),进程崩溃不会留下半截状态
 - 后台线程池调度,全局并发上限可控
+- 支持**工作流组**:一次提交一批工作流,组级防重、组级终态收敛、组级取消/终止
 - 每个状态转移都记录时间戳、来源状态、目标状态与**判定依据**,并打到日志
 
 ---
@@ -42,6 +43,29 @@ curl -X POST http://127.0.0.1:8000/workflows \
       {"id": "report", "action": "pass", "dependencies": ["fetch", "wobbly"]}
     ]
   }'
+```
+
+### 提交一组工作流
+
+```bash
+curl -X POST http://127.0.0.1:8000/groups \
+  -H 'Content-Type: application/json' \
+  -H 'Group-Key: batch-2026-10-03' \
+  -d '{
+    "group_id": "batch-1",
+    "workflows": [
+      {"workflow_id": "etl-users",  "tasks": [{"id": "extract", "action": "pass"},
+                                              {"id": "load", "action": "pass", "dependencies": ["extract"]}]},
+      {"workflow_id": "etl-orders", "tasks": [{"id": "extract", "action": "pass"},
+                                              {"id": "load", "action": "pass", "dependencies": ["extract"]}]}
+    ]
+  }'
+
+# 按组查询组内各工作流当前状态
+curl http://127.0.0.1:8000/groups/batch-1
+# 组级取消 / 终止(不可逆、幂等)
+curl -X POST http://127.0.0.1:8000/groups/batch-1/cancel
+curl -X POST http://127.0.0.1:8000/groups/batch-1/terminate
 ```
 
 ### 模拟动作(action)
@@ -165,6 +189,60 @@ PENDING -> RUNNING -> SUCCEEDED          (所有任务 SUCCEEDED)
 
 ---
 
+## 3A. 工作流组
+
+一组**一次提交、共同收尾**的工作流。每个成员工作流内部仍是原来的任务图结构,
+**成员的单工作流语义(依赖推进、失败传播、重试、取消)不因放进组里而改变**;
+组只是在其之上加一层防重、汇总结论与组级控制。
+
+### 3A.1 组级防重复提交
+
+- 组携带防重键 `group_key`(请求体或 `Group-Key` 头)。提交内容的规范化指纹
+  (`spec_hash`,成员工作流定义的 SHA-256,与成员顺序无关)随组一起持久化。
+- **同键同内容**(无论并发多少次、用哪个 `group_id` 重试):幂等返回**已落地的组**,
+  组下的工作流只建一次、只执行一次,不会出现同一批提交被重复建出来重复执行。
+- **同键不同内容**:拒绝,`GROUP_KEY_CONFLICT` / HTTP 409,响应体带 `existing_group_id`
+  指明这次提交最终落到了哪个已有组。该错误码与校验失败(`EMPTY_GROUP` /
+  `DUPLICATE_WORKFLOW_ID` / `CYCLE_DETECTED` 等 422)明确可区分。
+- **全有或全无**:组 + 全部成员工作流在一次存储事务内落盘;任一成员校验失败或
+  成员 `workflow_id` 与已有工作流冲突(`WORKFLOW_ID_CONFLICT` / 409)时整组拒绝,
+  不会留下"一半存在一半丢失"的状态。
+
+### 3A.2 组级终态语义
+
+组只有在**全部成员工作流到达终态**后才收敛,确定规则:
+
+| 条件 | 组终态 |
+|---|---|
+| 全部成员 `SUCCEEDED` | `SUCCEEDED` |
+| 组级取消/终止已生效 | `CANCELLED` |
+| 其余(有成员 `FAILED`/`CANCELLED`) | `FAILED`,`reason` 列出导致结论的成员及其原因 |
+
+- 成员失败**不会**让组内其他成员被悄悄跳过:未开始的成员照常推进到自己的终态,
+  失败成员内部的下游任务按原有规则确定性 `SKIPPED`(带 `skip_reason` / `skipped_by`)。
+- 组的 `reason` 汇总未成功成员的 `workflow_id=STATUS(成员reason)`,可逐级下钻到
+  具体任务的错误或跳过依据。
+
+### 3A.3 组级取消 / 终止
+
+- `POST /groups/{id}/cancel`:组级优雅取消(不可逆)。置持久化 `cancel_requested`,
+  作用到组内**所有尚未完成**的成员(等价于对每个成员执行单工作流取消);
+  已 `SUCCEEDED` 的成员原样保留、绝不重跑。组在全部成员终态后收敛为 `CANCELLED`。
+- `POST /groups/{id}/terminate`:组级立即终止(不可逆)。未完成成员立即进入
+  `CANCELLED` 终态,在执行任务收到中断信号、结果被丢弃;组立即进入 `CANCELLED` 终态。
+- 两者都**幂等**:重复调用返回同一终态;组标志与成员取消在同一持久化快照内生效,
+  进程重启后由恢复逻辑继续遵守(若有成员因崩溃未应用取消,调度器会确定性补齐)。
+
+### 3A.4 与单工作流接口的兼容范围
+
+- 单工作流的全部接口(`POST/GET /workflows...`、取消/终止、幂等键)行为不变;
+  组内成员也可以用单工作流接口查询。
+- 状态文件升级为 `version: 2`(新增 `groups` 字段),**兼容读取**旧的 version 1 文件。
+- 全局并发上限对组内所有成员统一生效:组内工作流再多,同时在执行的任务数也不越过
+  `max_concurrency`。
+
+---
+
 ## 4. HTTP 接口
 
 | 方法 | 路径 | 说明 |
@@ -176,6 +254,11 @@ PENDING -> RUNNING -> SUCCEEDED          (所有任务 SUCCEEDED)
 | GET  | `/workflows/{id}/tasks/{task_id}` | 查询单个任务 |
 | POST | `/workflows/{id}/cancel` | 优雅取消(不可逆) |
 | POST | `/workflows/{id}/terminate` | 立即终止(不可逆) |
+| POST | `/groups` | 一次提交一组工作流(支持 `Group-Key` 头防重) |
+| GET  | `/groups` | 列出工作流组(id + status) |
+| GET  | `/groups/{id}` | 查询组:组状态、reason、转移历史、组内各工作流当前状态 |
+| POST | `/groups/{id}/cancel` | 组级优雅取消(不可逆,幂等) |
+| POST | `/groups/{id}/terminate` | 组级立即终止(不可逆,幂等) |
 
 每个任务 / 工作流对象都带 `transitions` 数组,元素形如:
 
@@ -196,7 +279,7 @@ uv run pytest -q                   # 安静模式
 uv run pytest tests/test_recovery.py -v
 ```
 
-测试覆盖(共 31 个):
+测试覆盖(共 51 个):
 
 | 文件 | 场景 |
 |---|---|
@@ -204,13 +287,15 @@ uv run pytest tests/test_recovery.py -v
 | `tests/test_dependencies.py` | 全部依赖成功才执行、不可重试立即终止、依赖失败确定性 SKIPPED 多级传播、取消与终止的终态/幂等语义 |
 | `tests/test_retry_concurrency.py` | 指数退避重试后成功、重试预算耗尽收敛 FAILED、并发上限不被突破、同一任务只执行一次 |
 | `tests/test_recovery.py` | 重启后成功任务不重跑、终态与错误原因不丢失、RUNNING 崩溃回退重调度、取消请求跨重启生效 |
-| `tests/test_api.py` | HTTP 端到端:提交/查询/422/409/404/终止不可逆 |
+| `tests/test_groups.py` | 同一组键并发重复提交只落地一个组、组键冲突与校验失败可区分、整组全有或全无、成员失败时组级收敛且结论可解释、组级取消/终止幂等且已成功成员不重跑、重启后组终态与成员结论不丢失、组内并发不越上限 |
+| `tests/test_api.py` | HTTP 端到端:提交/查询/422/409/404/终止不可逆,含组端点(防重冲突 409、按组查询成员状态、组级终止幂等) |
 
 测试日志通过 `log_cli` 实时输出,统一格式:
 
 ```
 INFO [orchestrator.scheduler] task=wobbly transition RUNNING->PENDING reason=retryable failure ...
 INFO [orchestrator.scheduler] workflow=wf-1 transition RUNNING->SUCCEEDED reason=all 3 task(s) succeeded
+INFO [orchestrator.scheduler] group=batch-1 transition RUNNING->FAILED reason=member workflow(s) not succeeded: etl-users=FAILED(...)
 ```
 
 ### 端到端手动验证
@@ -224,14 +309,14 @@ INFO [orchestrator.scheduler] workflow=wf-1 transition RUNNING->SUCCEEDED reason
 
 ```
 orchestrator/
-  models.py        状态枚举/任务与工作流模型/退避策略/序列化
-  errors.py        可区分的失败原因(稳定 error_code)
-  store.py         本地 JSON 原子持久化 + RLock
+  models.py        状态枚举/任务、工作流与工作流组模型/退避策略/序列化
+  errors.py        可区分的失败原因(稳定 error_code,含组键冲突/组不存在)
+  store.py         本地 JSON 原子持久化 + RLock + 多实体事务(整组全有或全无)
   executor.py      本地确定性模拟执行器(pass/fail/flaky/sleep)
-  scheduler.py     调度循环:依赖推进/退避重试/并发上限/取消终止/崩溃恢复
-  service.py       门面:提交校验、幂等去重、查询、取消与终止
-  api.py           FastAPI 路由与错误码映射
+  scheduler.py     调度循环:依赖推进/退避重试/并发上限/取消终止/组级收敛/崩溃恢复
+  service.py       门面:提交校验、幂等去重(含组键防重)、查询、取消与终止
+  api.py           FastAPI 路由与错误码映射(含 /groups 端点)
   logging_setup.py 统一日志(任务标识/状态转移/判定依据)
-tests/             按场景组织的 31 个用例
+tests/             按场景组织的 51 个用例
 main.py            uvicorn 入口
 ```
