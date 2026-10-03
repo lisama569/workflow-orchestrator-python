@@ -123,3 +123,107 @@ def test_terminate_endpoint_is_terminal_and_idempotent(fastapi_client):
     assert client.post("/workflows/wf-1/terminate").json()["status"] == "CANCELLED"
     data = client.get("/workflows/wf-1").json()
     assert data["tasks"]["b"]["status"] == "CANCELLED"
+
+
+# ================= 工作流组 HTTP 端到端 =================
+def _group_body(group_id="g-1", key="gk-1", workflows=None):
+    return {
+        "group_id": group_id,
+        "group_key": key,
+        "workflows": workflows
+        or [
+            {"workflow_id": "w1", "tasks": [{"id": "a", "action": "pass"}]},
+            {"workflow_id": "w2", "tasks": [{"id": "b", "action": "pass"}]},
+        ],
+    }
+
+
+def _wait_group_status(client, group_id, expected, timeout=5):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = client.get(f"/groups/{group_id}").json()
+        if data["status"] == expected:
+            return data
+        time.sleep(0.02)
+    raise AssertionError(f"group did not reach {expected}, last={data['status']}")
+
+
+def test_group_submit_query_and_member_statuses(fastapi_client):
+    client, _, _ = fastapi_client
+    r = client.post("/groups", json=_group_body())
+    assert r.status_code == 201
+    assert r.json()["workflow_ids"] == ["w1", "w2"]
+    data = _wait_group_status(client, "g-1", "SUCCEEDED")
+    # 按组查询到组内各工作流当前状态
+    assert data["members"]["w1"]["status"] == "SUCCEEDED"
+    assert data["members"]["w2"]["status"] == "SUCCEEDED"
+    assert data["transitions"][-1]["to"] == "SUCCEEDED"
+    listing = client.get("/groups").json()
+    assert listing["groups"] == [{"id": "g-1", "status": "SUCCEEDED"}]
+
+
+def test_group_key_conflict_returns_409_with_existing_group(fastapi_client):
+    client, _, _ = fastapi_client
+    assert client.post("/groups", json=_group_body()).status_code == 201
+    conflict = _group_body(
+        group_id="g-2",
+        workflows=[{"workflow_id": "w9", "tasks": [{"id": "x", "action": "pass"}]}],
+    )
+    r = client.post("/groups", json=conflict)
+    assert r.status_code == 409
+    err = r.json()
+    assert err["error_code"] == "GROUP_KEY_CONFLICT"
+    assert err["existing_group_id"] == "g-1"
+    # 幂等重放(同键同内容)不是冲突:返回已落地的组
+    replay = _group_body(group_id="g-3")
+    r2 = client.post("/groups", json=replay)
+    assert r2.status_code == 201
+    assert r2.json()["id"] == "g-1"
+
+
+def test_group_validation_error_distinguishable_from_key_conflict(fastapi_client):
+    client, _, _ = fastapi_client
+    bad = _group_body(
+        workflows=[
+            {
+                "workflow_id": "w1",
+                "tasks": [
+                    {"id": "a", "action": "pass", "dependencies": ["b"]},
+                    {"id": "b", "action": "pass", "dependencies": ["a"]},
+                ],
+            }
+        ]
+    )
+    r = client.post("/groups", json=bad)
+    assert r.status_code == 422  # 校验失败:422,与 409 组键冲突可区分
+    assert r.json()["error_code"] == "CYCLE_DETECTED"
+    assert client.get("/groups").json()["groups"] == []  # 全有或全无:无任何落地
+
+
+def test_group_not_found_and_terminal_cancel(fastapi_client):
+    client, _, _ = fastapi_client
+    r = client.get("/groups/ghost")
+    assert r.status_code == 404
+    assert r.json()["error_code"] == "GROUP_NOT_FOUND"
+    client.post("/groups", json=_group_body())
+    _wait_group_status(client, "g-1", "SUCCEEDED")
+    r = client.post("/groups/g-1/cancel")
+    assert r.status_code == 409  # 已终态(非取消)的组拒绝取消
+    assert r.json()["error_code"] == "TERMINAL_STATE"
+
+
+def test_group_terminate_is_immediate_and_idempotent(fastapi_client):
+    client, _, _ = fastapi_client
+    body = _group_body(
+        workflows=[{"workflow_id": "w1", "tasks": [{"id": "s", "action": "sleep", "params": {"seconds": 1.0}}]}]
+    )
+    client.post("/groups", json=body)
+    time.sleep(0.1)
+    r = client.post("/groups/g-1/terminate")
+    assert r.status_code == 200
+    assert r.json()["status"] == "CANCELLED"  # 组立即终态
+    r2 = client.post("/groups/g-1/terminate")  # 重复终止幂等
+    assert r2.status_code == 200
+    assert r2.json()["status"] == "CANCELLED"
+    data = client.get("/groups/g-1").json()
+    assert data["members"]["w1"]["status"] == "CANCELLED"
