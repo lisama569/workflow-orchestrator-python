@@ -104,7 +104,35 @@ class Scheduler:
         workflows = self.store.load_all()
         for wf_id, wf in workflows.items():
             if wf.status.is_terminal:
-                logger.info("recovery: workflow=%s kept terminal status=%s", wf_id, wf.status.value)
+                # 终止是立即终态:崩溃可能发生在"工作流已 CANCELLED 落盘"与
+                # "在执行任务结果按 CANCELLED 收敛"之间,状态文件里会残留 RUNNING 任务。
+                # 这里确定性补齐,保证重启后不会出现"终态工作流里挂着 RUNNING 任务"。
+                if wf.cancel_requested and any(
+                    t.status in (TaskStatus.RUNNING, TaskStatus.PENDING)
+                    for t in wf.tasks.values()
+                ):
+                    for t in wf.tasks.values():
+                        if t.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
+                            self._set_task(
+                                t,
+                                TaskStatus.CANCELLED,
+                                "crash recovery: workflow already cancelled; "
+                                "unfinished task converges to CANCELLED",
+                                now,
+                            )
+                            t.finished_at = now
+                    wf.updated_at = now
+                    self.store.save_workflow(wf)
+                    logger.info(
+                        "recovery: workflow=%s terminal(%s); leftover unfinished task(s) "
+                        "converged to CANCELLED",
+                        wf_id,
+                        wf.status.value,
+                    )
+                else:
+                    logger.info(
+                        "recovery: workflow=%s kept terminal status=%s", wf_id, wf.status.value
+                    )
                 continue
             changed = False
             for tid, t in wf.tasks.items():
@@ -156,27 +184,32 @@ class Scheduler:
         wf_lock = self._lock_for(workflow_id)
 
         def _apply(wf: WorkflowState) -> None:
-            with wf_lock:
-                now = time.time()
-                if wf.status == WorkflowStatus.CANCELLED or wf.cancel_requested:
-                    logger.info("workflow=%s cancel is already effective; idempotent no-op", workflow_id)
-                    return
-                if wf.status.is_terminal:
-                    raise TerminalStateError(workflow_id, wf.status.value)
-                self._apply_cancel_to_wf(wf, reason, force_terminal, now)
-                inflights = [
-                    inf for (wid, _tid), inf in list(self._running.items()) if wid == workflow_id
-                ]
-                for inf in inflights:
-                    inf.cancel_event.set()
-                logger.info(
-                    "workflow=%s %s; %d in-flight task(s) signalled",
-                    workflow_id,
-                    "terminated" if force_terminal else "cancelled",
-                    len(inflights),
-                )
+            # 纯状态变更:此处已持有 wf_lock 与存储锁,绝不再获取任何锁。
+            now = time.time()
+            if wf.status == WorkflowStatus.CANCELLED or wf.cancel_requested:
+                logger.info("workflow=%s cancel is already effective; idempotent no-op", workflow_id)
+                return
+            if wf.status.is_terminal:
+                raise TerminalStateError(workflow_id, wf.status.value)
+            self._apply_cancel_to_wf(wf, reason, force_terminal, now)
 
-        self.store.mutate(workflow_id, _apply)
+        # 锁顺序约定:一律 工作流锁 -> 存储锁(与 tick / 完成回调 _work 一致)。
+        # 严禁在 store.mutate 持有的存储锁内再获取工作流锁:完成回调持工作流锁
+        # 等存储锁,若此处持存储锁等工作流锁,即 AB-BA 死锁,整个服务随之卡死。
+        with wf_lock:
+            self.store.mutate(workflow_id, _apply)
+        # 状态已落盘(取消先持久化,崩溃恢复也会遵守),再在锁外对在执行任务发中断信号。
+        # 遍历 _running 必须持 _running_lock:与 _submit/_work 的并发增删否则会竞态。
+        with self._running_lock:
+            inflights = [inf for (wid, _), inf in self._running.items() if wid == workflow_id]
+        for inf in inflights:
+            inf.cancel_event.set()
+        logger.info(
+            "workflow=%s %s; %d in-flight task(s) signalled",
+            workflow_id,
+            "terminated" if force_terminal else "cancelled",
+            len(inflights),
+        )
         self.notify()
 
     def _apply_cancel_to_wf(
