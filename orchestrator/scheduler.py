@@ -6,7 +6,10 @@
   3. 全局在执行任务数永不超过 max_concurrency;同一 (工作流,任务) 同时只执行一次;
   4. 可重试失败按指数退避重试到 max_attempts,不可重试失败立即 FAILED 终态;
   5. 成功/终态落盘后进程重启不重跑;崩溃时处于 RUNNING 的任务回退 PENDING 重调度;
-  6. 取消/终止通过持久化的 cancel_requested 标志表达,不可逆;终止立即进入终态。
+  6. 取消/终止通过持久化的 cancel_requested 标志表达,不可逆;终止立即进入终态;
+  7. 锁序全局统一为【工作流锁 -> 存储锁 -> 在执行表锁】:tick、任务完成回调、
+     单工作流取消/终止均先取工作流锁再进存储事务;组事务不取工作流锁,
+     中断信号在事务提交后按成员加锁补发。取消/终止因此可与任务执行任意交错而不死锁。
 """
 from __future__ import annotations
 
@@ -104,7 +107,20 @@ class Scheduler:
         workflows = self.store.load_all()
         for wf_id, wf in workflows.items():
             if wf.status.is_terminal:
-                logger.info("recovery: workflow=%s kept terminal status=%s", wf_id, wf.status.value)
+                # 终止已落盘但在执行任务的完成回调尚未落盘(进程崩溃)时,
+                # 终态工作流上可能残留 RUNNING/PENDING 任务:终态不可逆,
+                # 结论确定为 CANCELLED,这里确定性补齐,绝不重跑。
+                reopen = self._sweep_terminal_cancelled_tasks(wf, now)
+                if reopen:
+                    wf.updated_at = now
+                    self.store.save_workflow(wf)
+                    logger.info(
+                        "recovery: terminal workflow=%s swept unfinished tasks to CANCELLED", wf_id
+                    )
+                else:
+                    logger.info(
+                        "recovery: workflow=%s kept terminal status=%s", wf_id, wf.status.value
+                    )
                 continue
             changed = False
             for tid, t in wf.tasks.items():
@@ -133,6 +149,31 @@ class Scheduler:
                     g.status.value,
                 )
 
+    def _sweep_terminal_cancelled_tasks(self, wf: WorkflowState, now: float) -> bool:
+        """终态工作流恢复时的确定性补齐。
+
+        仅对 CANCELLED 终态(取消/终止)有意义:终止落盘后、完成回调落盘前崩溃,
+        会留下 RUNNING(或退避 PENDING)任务。终态不可逆,这些任务一律 CANCELLED,
+        不回退、不重跑。返回是否发生了补齐(需要落盘)。
+        """
+        if wf.status != WorkflowStatus.CANCELLED:
+            return False
+        changed = False
+        for t in wf.tasks.values():
+            if t.status in (TaskStatus.RUNNING, TaskStatus.PENDING):
+                was_running = t.status == TaskStatus.RUNNING
+                self._set_task(
+                    t,
+                    TaskStatus.CANCELLED,
+                    "crash recovery: workflow already terminal, unfinished task closed as cancelled",
+                    now,
+                )
+                t.finished_at = now
+                if not was_running:
+                    t.started_at = None
+                changed = True
+        return changed
+
     def notify(self) -> None:
         self._wake_event.set()
 
@@ -154,29 +195,61 @@ class Scheduler:
 
     def _request_cancel(self, workflow_id: str, reason: str, force_terminal: bool) -> None:
         wf_lock = self._lock_for(workflow_id)
+        affected = False
 
         def _apply(wf: WorkflowState) -> None:
-            with wf_lock:
-                now = time.time()
-                if wf.status == WorkflowStatus.CANCELLED or wf.cancel_requested:
-                    logger.info("workflow=%s cancel is already effective; idempotent no-op", workflow_id)
-                    return
-                if wf.status.is_terminal:
-                    raise TerminalStateError(workflow_id, wf.status.value)
-                self._apply_cancel_to_wf(wf, reason, force_terminal, now)
-                inflights = [
-                    inf for (wid, _tid), inf in list(self._running.items()) if wid == workflow_id
-                ]
+            nonlocal affected
+            now = time.time()
+            if wf.status == WorkflowStatus.CANCELLED or wf.cancel_requested:
+                # 已接受过取消/终止:本次可能是"先取消后终止",需要升级为立即终态;
+                # 否则就是重复请求,幂等 no-op。
+                if force_terminal and not wf.status.is_terminal:
+                    # "先优雅取消、后立即终止":升级为立即终态,
+                    # 退避/未派发的 PENDING 任务立即 CANCELLED,在执行任务由中断信号收尾。
+                    for t in wf.tasks.values():
+                        if t.status == TaskStatus.PENDING:
+                            self._set_task(
+                                t,
+                                TaskStatus.CANCELLED,
+                                "workflow termination escalated before task started",
+                                now,
+                            )
+                    self._set_wf(wf, WorkflowStatus.CANCELLED, f"terminated: {reason}", now)
+                    wf.reason = reason
+                    wf.cancel_reason = reason
+                    wf.updated_at = now
+                    affected = True
+                else:
+                    logger.info(
+                        "workflow=%s cancel is already effective; idempotent no-op", workflow_id
+                    )
+                return
+            if wf.status.is_terminal:
+                raise TerminalStateError(workflow_id, wf.status.value)
+            self._apply_cancel_to_wf(wf, reason, force_terminal, now)
+            affected = True
+
+        # 锁顺序约定:一律 工作流锁 -> 存储锁(与 tick、完成回调一致)。
+        # 绝不能在 store.mutate 事务内再获取工作流锁,否则会与完成回调
+        # (工作流锁 -> 存储锁)构成 AB-BA,在任务执行完成的瞬间取消即可卡死整个服务。
+        inflights: list[_Inflight] = []
+        with wf_lock:
+            self.store.mutate(workflow_id, _apply)
+            if affected:
+                # 在工作流锁内读在执行表(与 _tick_locked 一致的锁序),
+                # 此时新任务还没被派发、旧任务完成回调拿不到工作流锁,读到的集合确定。
+                with self._running_lock:
+                    inflights = [
+                        inf for (wid, _tid), inf in self._running.items() if wid == workflow_id
+                    ]
                 for inf in inflights:
                     inf.cancel_event.set()
-                logger.info(
-                    "workflow=%s %s; %d in-flight task(s) signalled",
-                    workflow_id,
-                    "terminated" if force_terminal else "cancelled",
-                    len(inflights),
-                )
-
-        self.store.mutate(workflow_id, _apply)
+        logger.info(
+            "workflow=%s %s; %d in-flight task(s) signalled",
+            workflow_id,
+            "terminated" if force_terminal else "cancelled",
+            len(inflights) if affected else 0,
+        )
         self.notify()
 
     def _apply_cancel_to_wf(
@@ -203,6 +276,30 @@ class Scheduler:
             # 终止:工作流立即终态;在执行任务的结果稍后一律按 CANCELLED 收敛。
             self._set_wf(wf, WorkflowStatus.CANCELLED, f"terminated: {reason}", now)
 
+    def _escalate_wf_terminal(
+        self, wf: WorkflowState, reason: str, now: float
+    ) -> bool:
+        """工作流已接受过优雅取消、尚未终态,此时收到立即终止:升级为立即终态。
+
+        已 PENDING(含退避等待)的任务立即 CANCELLED,在执行任务由中断信号收尾。
+        返回是否真的发生了升级(调用方据此决定是否要补发中断信号)。
+        """
+        if wf.status.is_terminal or not wf.cancel_requested:
+            return False
+        wf.cancel_reason = reason
+        wf.updated_at = now
+        for t in wf.tasks.values():
+            if t.status == TaskStatus.PENDING:
+                self._set_task(
+                    t,
+                    TaskStatus.CANCELLED,
+                    "workflow termination escalated before task started",
+                    now,
+                )
+        self._set_wf(wf, WorkflowStatus.CANCELLED, f"terminated: {reason}", now)
+        wf.reason = reason
+        return True
+
     # ================= 组级控制面 =================
     def request_group_cancel(self, group_id: str, reason: str = "cancel requested by client") -> None:
         """组级优雅取消(不可逆):作用到组内所有尚未完成的工作流,重复调用幂等。"""
@@ -223,7 +320,20 @@ class Scheduler:
             if g is None:
                 raise KeyError(group_id)  # 服务层已先校验存在
             if g.status == GroupStatus.CANCELLED or g.cancel_requested:
-                logger.info("group=%s cancel is already effective; idempotent no-op", group_id)
+                if force_terminal and not g.status.is_terminal:
+                    # "先优雅取消、后立即终止":把已取消但还没跑完的成员升级为立即终态。
+                    self._set_group(g, GroupStatus.CANCELLED, f"terminated: {reason}", now)
+                    g.reason = reason
+                    g.updated_at = now
+                    member_reason = f"group {group_id} terminate: {reason}"
+                    for wid in g.workflow_ids:
+                        wf = wfs.get(wid)
+                        if wf is not None and not wf.status.is_terminal and self._escalate_wf_terminal(
+                            wf, member_reason, now
+                        ):
+                            affected.append(wid)
+                else:
+                    logger.info("group=%s cancel is already effective; idempotent no-op", group_id)
                 return
             if g.status.is_terminal:
                 raise TerminalStateError(group_id, g.status.value)
@@ -245,17 +355,22 @@ class Scheduler:
                 g.reason = reason
 
         self.store.transact(_txn)
-        # 状态已落盘,再给成员的在执行任务发中断信号
-        with self._running_lock:
-            inflights = [inf for (wid, _), inf in self._running.items() if wid in affected]
-        for inf in inflights:
-            inf.cancel_event.set()
+        # 状态已落盘,再给成员的在执行任务发中断信号(组事务不取工作流锁,
+        # 这里按成员取工作流锁后读在执行表,锁序与其余路径一致)
+        signalled = 0
+        for wid in affected:
+            wf_lock = self._lock_for(wid)
+            with wf_lock, self._running_lock:
+                inflights = [inf for (w, _), inf in self._running.items() if w == wid]
+            for inf in inflights:
+                inf.cancel_event.set()
+                signalled += 1
         logger.info(
             "group=%s %s; %d member workflow(s) affected, %d in-flight task(s) signalled",
             group_id,
             "terminated" if force_terminal else "cancelled",
             len(affected),
-            len(inflights),
+            signalled,
         )
         self.notify()
 
